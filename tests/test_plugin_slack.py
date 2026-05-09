@@ -510,6 +510,60 @@ apprise_url_tests = (
             "response": False,
         },
     ),
+    # Workflow Builder webhook (4-segment /workflows/ path)
+    (
+        "slack://T1JJ3T3L2/Ft07XXXX/XXXXXXXX/YYYYYYYY/?mode=workflow",
+        {
+            "instance": NotifySlack,
+        },
+    ),
+    # Workflow trigger webhook (3-segment /triggers/ path)
+    (
+        "slack://T1JJ3T3L2/XXXXXXXX/YYYYYYYY/?mode=trigger",
+        {
+            "instance": NotifySlack,
+        },
+    ),
+    # Workflow native URL (/workflows/)
+    (
+        (
+            "https://hooks.slack.com/workflows/"
+            "T1JJ3T3L2/Ft07XXXX/XXXXXXXX/YYYYYYYY"
+        ),
+        {
+            "instance": NotifySlack,
+            "privacy_url": "slack://T...2/F...X/X...X/Y...Y/",
+        },
+    ),
+    # Workflow trigger native URL (/triggers/)
+    (
+        "https://hooks.slack.com/triggers/T1JJ3T3L2/XXXXXXXX/YYYYYYYY",
+        {
+            "instance": NotifySlack,
+            "privacy_url": "slack://T...2/X...X/Y...Y/",
+        },
+    ),
+    # Workflow mode -- too few segments (2 of required 4)
+    (
+        "slack://T1JJ3T3L2/XXXXXXXX/?mode=workflow",
+        {
+            "instance": TypeError,
+        },
+    ),
+    # Workflow mode -- wrong count: trigger's 3 segments rejected
+    (
+        "slack://T1JJ3T3L2/XXXXXXXX/YYYYYYYY/?mode=workflow",
+        {
+            "instance": TypeError,
+        },
+    ),
+    # Trigger mode -- wrong count: workflow's 4 segments rejected
+    (
+        "slack://T1JJ3T3L2/Ft07XXXX/XXXXXXXX/YYYYYYYY/?mode=trigger",
+        {
+            "instance": TypeError,
+        },
+    ),
 )
 
 
@@ -1667,3 +1721,324 @@ def test_plugin_slack_template_inaccessible(mock_request, tmpdir):
         obj.notify(body="x", title="y", notify_type=NotifyType.INFO) is False
     )
     assert mock_request.called is False
+
+
+def test_plugin_slack_template_add_failure():
+    """NotifySlack() - TypeError when AppriseAttachment.add() drops entry."""
+    # Simulate add() silently failing (returns 0 / len stays 0)
+    with mock.patch("apprise.plugins.slack.AppriseAttachment") as mock_cls:
+        inst = mock.MagicMock()
+        inst.__len__ = mock.Mock(return_value=0)
+        mock_cls.return_value = inst
+
+        with pytest.raises(TypeError):
+            NotifySlack(
+                token_a="T1JJ3T3L2",
+                token_b="A1BRTD4JD",
+                token_c="TIiajkdnlazkcOXrIdevi7FQ",
+                template="file:///some/template.json",
+            )
+
+
+@mock.patch("requests.request")
+def test_plugin_slack_template_content_not_dict(mock_request, tmpdir):
+    """NotifySlack() - template that parses to a JSON array is rejected."""
+    mock_request.return_value = mock.Mock(
+        **{"content": b"ok", "status_code": requests.codes.ok}
+    )
+
+    # Valid JSON but a list rather than an object
+    template = tmpdir.join("array.json")
+    template.write('[{"type": "section"}]')
+
+    obj = Apprise.instantiate(
+        "slack://T1JJ3T3L2/A1BRTD4JD/TIiajkdnlazkcOXrIdevi7FQ/"
+        "?template={}".format(str(template))
+    )
+    assert isinstance(obj, NotifySlack)
+    assert (
+        obj.notify(body="x", title="y", notify_type=NotifyType.INFO) is False
+    )
+    assert mock_request.called is False
+
+
+@mock.patch("requests.request")
+def test_plugin_slack_template_block_not_dict(mock_request, tmpdir):
+    """NotifySlack() - non-dict entry in blocks list is rejected."""
+    mock_request.return_value = mock.Mock(
+        **{"content": b"ok", "status_code": requests.codes.ok}
+    )
+
+    # blocks list contains a string rather than a dict
+    template = tmpdir.join("bad_block.json")
+    template.write('{"blocks": ["not-a-dict"]}')
+
+    obj = Apprise.instantiate(
+        "slack://T1JJ3T3L2/A1BRTD4JD/TIiajkdnlazkcOXrIdevi7FQ/"
+        "?template={}".format(str(template))
+    )
+    assert isinstance(obj, NotifySlack)
+    assert (
+        obj.notify(body="x", title="y", notify_type=NotifyType.INFO) is False
+    )
+    assert mock_request.called is False
+
+
+@mock.patch("requests.request")
+def test_plugin_slack_template_none_token_value(mock_request, tmpdir):
+    """NotifySlack() - None token value (e.g. app_image_url) is coerced
+    to empty string before JSON-escaping."""
+    mock_request.return_value = mock.Mock(
+        **{"content": b"ok", "status_code": requests.codes.ok}
+    )
+
+    # Template references app_image_url which will be None when
+    # include_image=False; old code produced corrupted JSON ("ul")
+    template = tmpdir.join("img.json")
+    template.write(
+        '{"blocks": [{"type": "section",'
+        ' "text": {"type": "mrkdwn",'
+        ' "text": "{{app_body}} img={{app_image_url}}"}}]}'
+    )
+
+    obj = Apprise.instantiate(
+        "slack://T1JJ3T3L2/A1BRTD4JD/TIiajkdnlazkcOXrIdevi7FQ/"
+        "?image=no&template={}".format(str(template))
+    )
+    assert isinstance(obj, NotifySlack)
+    # Must succeed -- None coerced to "" keeps the JSON valid
+    assert (
+        obj.notify(body="hello", title="t", notify_type=NotifyType.INFO)
+        is True
+    )
+    assert mock_request.called is True
+    payload = loads(mock_request.call_args_list[0][1]["data"])
+    block_text = payload["attachments"][0]["blocks"][0]["text"]["text"]
+    # app_image_url should expand to empty string, not "ul"
+    assert "img=" in block_text
+    assert "ul" not in block_text
+
+
+@mock.patch("requests.request")
+def test_plugin_slack_workflow_default_payload(mock_request):
+    """NotifySlack() - Workflow Builder mode, default text payload."""
+    mock_request.return_value = mock.Mock(
+        **{"content": b"", "status_code": requests.codes.ok}
+    )
+
+    # 4-segment /workflows/ path via mode=workflow
+    obj = Apprise.instantiate(
+        "slack://T1JJ3T3L2/Ft07XXXX/XXXXXXXX/YYYYYYYY/?mode=workflow"
+    )
+    assert isinstance(obj, NotifySlack)
+    assert obj.mode == "workflow"
+    assert obj.workflow_path == [
+        "T1JJ3T3L2",
+        "Ft07XXXX",
+        "XXXXXXXX",
+        "YYYYYYYY",
+    ]
+
+    # Notification with title
+    assert (
+        obj.notify(body="hello", title="Alert", notify_type=NotifyType.INFO)
+        is True
+    )
+    assert mock_request.called is True
+    # Verify the POST URL uses the workflow base
+    call_url = mock_request.call_args_list[0][0][1]
+    assert "hooks.slack.com/workflows/" in call_url
+    assert "T1JJ3T3L2/Ft07XXXX/XXXXXXXX/YYYYYYYY" in call_url
+    # Verify default payload combines title and body
+    posted = loads(mock_request.call_args_list[0][1]["data"])
+    assert posted["text"] == "Alert: hello"
+
+    mock_request.reset_mock()
+
+    # Notification without title -- body only
+    assert (
+        obj.notify(body="body only", title="", notify_type=NotifyType.INFO)
+        is True
+    )
+    posted = loads(mock_request.call_args_list[0][1]["data"])
+    assert posted["text"] == "body only"
+
+
+@mock.patch("requests.request")
+def test_plugin_slack_workflow_trigger_mode(mock_request):
+    """NotifySlack() - Workflow trigger mode (/triggers/ URL)."""
+    mock_request.return_value = mock.Mock(
+        **{"content": b"", "status_code": requests.codes.ok}
+    )
+
+    # 3-segment /triggers/ path via mode=trigger
+    obj = Apprise.instantiate(
+        "slack://T1JJ3T3L2/XXXXXXXX/YYYYYYYY/?mode=trigger"
+    )
+    assert isinstance(obj, NotifySlack)
+    assert obj.mode == "trigger"
+    assert obj.workflow_path == ["T1JJ3T3L2", "XXXXXXXX", "YYYYYYYY"]
+
+    assert obj.notify(body="hi", title="", notify_type=NotifyType.INFO) is True
+    call_url = mock_request.call_args_list[0][0][1]
+    assert "hooks.slack.com/triggers/" in call_url
+    assert "T1JJ3T3L2/XXXXXXXX/YYYYYYYY" in call_url
+
+
+@mock.patch("requests.request")
+def test_plugin_slack_workflow_native_url(mock_request):
+    """NotifySlack() - parse_native_url() handles workflow/trigger URLs."""
+    mock_request.return_value = mock.Mock(
+        **{"content": b"", "status_code": requests.codes.ok}
+    )
+
+    # /workflows/ native URL
+    obj = Apprise.instantiate(
+        "https://hooks.slack.com/workflows"
+        "/T1JJ3T3L2/Ft07XXXX/XXXXXXXX/YYYYYYYY"
+    )
+    assert isinstance(obj, NotifySlack)
+    assert obj.mode == "workflow"
+    assert obj.workflow_path == [
+        "T1JJ3T3L2",
+        "Ft07XXXX",
+        "XXXXXXXX",
+        "YYYYYYYY",
+    ]
+    assert (
+        obj.notify(body="native", title="", notify_type=NotifyType.INFO)
+        is True
+    )
+    call_url = mock_request.call_args_list[0][0][1]
+    assert "hooks.slack.com/workflows/T1JJ3T3L2" in call_url
+
+    mock_request.reset_mock()
+
+    # /triggers/ native URL
+    obj2 = Apprise.instantiate(
+        "https://hooks.slack.com/triggers/T1JJ3T3L2/XXXXXXXX/YYYYYYYY"
+    )
+    assert isinstance(obj2, NotifySlack)
+    assert obj2.mode == "trigger"
+    assert (
+        obj2.notify(body="trigger", title="", notify_type=NotifyType.INFO)
+        is True
+    )
+    call_url2 = mock_request.call_args_list[0][0][1]
+    assert "hooks.slack.com/triggers/T1JJ3T3L2" in call_url2
+
+
+@mock.patch("requests.request")
+def test_plugin_slack_workflow_url_roundtrip(mock_request):
+    """NotifySlack() - workflow url()/parse_url() round-trip."""
+    mock_request.return_value = mock.Mock(
+        **{"content": b"", "status_code": requests.codes.ok}
+    )
+
+    original = "slack://T1JJ3T3L2/Ft07XXXX/XXXXXXXX/YYYYYYYY/?mode=workflow"
+    obj = Apprise.instantiate(original)
+    assert isinstance(obj, NotifySlack)
+
+    # Reconstruct from url() output and re-instantiate
+    rebuilt = Apprise.instantiate(obj.url())
+    assert isinstance(rebuilt, NotifySlack)
+    assert rebuilt.mode == obj.mode
+    assert rebuilt.workflow_path == obj.workflow_path
+
+
+def test_plugin_slack_workflow_invalid_path():
+    """NotifySlack() - invalid path segment counts raise TypeError."""
+    from apprise.plugins.slack import NotifySlack as _NS
+
+    # Too few segments for explicit workflow mode (needs 4)
+    with pytest.raises(TypeError):
+        _NS(workflow_path=["T1JJ3T3L2", "XXXXXXXX"], mode="workflow")
+
+    # Trigger's 3 segments rejected when mode=workflow is explicit
+    with pytest.raises(TypeError):
+        _NS(
+            workflow_path=["T1JJ3T3L2", "XXXXXXXX", "YYYYYYYY"],
+            mode="workflow",
+        )
+
+    # Workflow's 4 segments rejected when mode=trigger is explicit
+    with pytest.raises(TypeError):
+        _NS(
+            workflow_path=["T1JJ3T3L2", "Ft07XXXX", "XXXXXXXX", "YYYY"],
+            mode="trigger",
+        )
+
+    # Empty path -- must raise (auto-detect path, 0 segments)
+    with pytest.raises(TypeError):
+        _NS(workflow_path=[], mode="workflow")
+
+    # Non-string / non-list type (else branch) -- 0 segments, must raise
+    with pytest.raises(TypeError):
+        _NS(workflow_path=42, mode="workflow")
+
+    # Auto-detect: 4 segments -> WORKFLOW
+    obj = _NS(workflow_path=["T1JJ3T3L2", "Ft07XXXX", "XXXXXXXX", "YYY"])
+    assert obj.mode == "workflow"
+    assert obj.workflow_path == ["T1JJ3T3L2", "Ft07XXXX", "XXXXXXXX", "YYY"]
+
+    # Auto-detect: 3 segments -> WORKFLOW_TRIGGER
+    obj = _NS(workflow_path=["T1JJ3T3L2", "XXXXXXXX", "YYYYYYYY"])
+    assert obj.mode == "trigger"
+    assert obj.workflow_path == ["T1JJ3T3L2", "XXXXXXXX", "YYYYYYYY"]
+
+    # Auto-detect: 2 segments -> TypeError (neither 3 nor 4)
+    with pytest.raises(TypeError):
+        _NS(workflow_path=["T1JJ3T3L2", "XXXXXXXX"])
+
+
+@mock.patch("requests.request")
+def test_plugin_slack_workflow_template(mock_request, tmpdir):
+    """NotifySlack() - Workflow mode with Block Kit JSON template."""
+    mock_request.return_value = mock.Mock(
+        **{"content": b"", "status_code": requests.codes.ok}
+    )
+
+    template = tmpdir.join("wf_blocks.json")
+    template.write(
+        cleandoc("""
+        {
+          "blocks": [
+            {
+              "type": "section",
+              "text": {"type": "mrkdwn", "text": "{{app_body}}"}
+            }
+          ]
+        }
+        """)
+    )
+
+    obj = Apprise.instantiate(
+        "slack://T1JJ3T3L2/Ft07XXXX/XXXXXXXX/YYYYYYYY/"
+        "?mode=workflow&template={}".format(str(template))
+    )
+    assert isinstance(obj, NotifySlack)
+    assert obj.mode == "workflow"
+    assert (
+        obj.notify(body="wf-tmpl", title="", notify_type=NotifyType.INFO)
+        is True
+    )
+    assert mock_request.called is True
+    call_url = mock_request.call_args_list[0][0][1]
+    assert "hooks.slack.com/workflows/" in call_url
+    posted = loads(mock_request.call_args_list[0][1]["data"])
+    blocks = posted["blocks"]
+    section = next(b for b in blocks if b.get("type") == "section")
+    assert section["text"]["text"] == "wf-tmpl"
+
+    # Invalid JSON template -- gen_payload() fails, send() returns False
+    bad_template = tmpdir.join("bad.json")
+    bad_template.write("not-json!")
+    obj2 = Apprise.instantiate(
+        "slack://T1JJ3T3L2/Ft07XXXX/XXXXXXXX/YYYYYYYY/"
+        "?mode=workflow&template={}".format(str(bad_template))
+    )
+    assert isinstance(obj2, NotifySlack)
+    assert (
+        obj2.notify(body="x", title="", notify_type=NotifyType.INFO) is False
+    )
+    assert mock_request.call_count == 1  # no new request made
